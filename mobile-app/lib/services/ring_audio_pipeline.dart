@@ -391,7 +391,7 @@ class RingAudioPipeline {
     // Try keys in order (the known-working key first), then models.
     final keyOrder = [
       _workingKeyIndex,
-      for (final i in _kDeepgramKeys.indices)
+      for (var i = 0; i < _kDeepgramKeys.length; i++)
         if (i != _workingKeyIndex) i,
     ];
 

@@ -1,4 +1,4 @@
-﻿name: zero_air
+name: zero_air
 description: The AI that lives on your finger.
 publish_to: 'none'
 
@@ -56,7 +56,6 @@ flutter:
     - assets/images/
     - assets/videos/
     - assets/kws/keywords.txt
-    - assets/audio/test.wav
 
 hooks:
   user_defines:
