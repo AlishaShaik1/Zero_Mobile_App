@@ -75,6 +75,12 @@ class RingBleHandler(private val context: Context) {
     // ring→phone voice link is verifiable in logcat (tag "RingBle").
     private var audioChunkCounter = 0
 
+    // Voice-link diagnostics (reported to the Dart UI):
+    // negotiated MTU + whether the mic characteristic NOTIFY is truly armed.
+    private var lastMtu = 23
+    private var micNotifyOk = false
+    private var mtuRetryDone = false
+
     // Auto-reconnect supervisor loop
     private var reconnectRunnable: Runnable? = null
 
@@ -370,6 +376,9 @@ class RingBleHandler(private val context: Context) {
                     android.util.Log.i("RingBle", "GATT connected (status=$status). Discovering services in 300ms...")
                     gatt133RetryCount = 0
                     characteristicsEnabled = false
+                    mtuRetryDone = false
+                    micNotifyOk = false
+                    lastMtu = 23
                     mainHandler.postDelayed({
                         try {
                             val ok = g.discoverServices()
@@ -452,12 +461,38 @@ class RingBleHandler(private val context: Context) {
             charCaption = svc.getCharacteristic(CHAR_CAPTION)
 
             // Request MTU in background, but enable characteristics immediately without blocking! (v1.0.5+6)
-            try { g.requestMtu(MTU_REQUEST) } catch (_: Exception) {}
+            // Voice audio chunks are 240 bytes — if this negotiation fails the
+            // ring can only send 1-byte markers (user sees "Listening" but no
+            // words). onMtuChanged logs the result and retries if it's small.
+            try {
+                val ok = g.requestMtu(MTU_REQUEST)
+                android.util.Log.i("RingBle", "requestMtu($MTU_REQUEST) accepted: $ok")
+            } catch (_: Exception) {}
             enableCharacteristics(g, svc)
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             android.util.Log.i("RingBle", "MTU changed: $mtu (status=$status)")
+            lastMtu = mtu
+            // Tell the Dart UI the negotiated MTU (voice needs a big one —
+            // 240-byte audio chunks cannot pass with the default MTU 23).
+            sendEvent(mapOf("type" to "mtu", "mtu" to mtu, "status" to status))
+
+            if (status != BluetoothGatt.GATT_SUCCESS || mtu < 250) {
+                // Some Android BLE stacks reject the first MTU request made
+                // right after service discovery — retry once. Voice audio
+                // (240B chunks) is silently dropped at MTU 23, which is
+                // exactly the "says listening but no text" failure mode.
+                if (!mtuRetryDone) {
+                    mtuRetryDone = true
+                    mainHandler.postDelayed({
+                        val cur = gatt ?: return@postDelayed
+                        android.util.Log.i("RingBle", "Retrying requestMtu($MTU_REQUEST)")
+                        try { cur.requestMtu(MTU_REQUEST) } catch (_: Exception) {}
+                    }, 600)
+                }
+                return
+            }
             val svc = g.getService(SERVICE_UUID) ?: run {
                 for (s in g.services) {
                     if (s.uuid.toString().startsWith("6e40", ignoreCase = true)) return@run s
@@ -517,6 +552,18 @@ class RingBleHandler(private val context: Context) {
             status: Int
         ) {
             writeInFlight = false
+            // Voice-link check: when the mic characteristic's CCCD write lands,
+            // verify Android actually armed NOTIFY. If not, the ring's audio
+            // never reaches the phone (silent "listening but no text" bug).
+            if (descriptor.characteristic?.uuid == CHAR_MIC_AUDIO) {
+                val armed = status == BluetoothGatt.GATT_SUCCESS
+                micNotifyOk = armed
+                android.util.Log.i(
+                    "RingBle",
+                    "Mic NOTIFY CCCD write: status=$status armed=$armed"
+                )
+                sendEvent(mapOf("type" to "voice_link", "mic" to armed))
+            }
             drainQueue(g)
         }
     }

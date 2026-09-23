@@ -407,6 +407,10 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
               delegate: SliverChildListDelegate([
                 // ── Connection hero card ─────────────────────────────────
                 _buildConnectionHero(isConn, isScan),
+                const SizedBox(height: 8),
+
+                // ── Voice link diagnostics (which stage is broken?) ─────
+                _buildVoiceLinkDiagnostics(isConn),
                 const SizedBox(height: 16),
 
                 // ── OLED mirror + quick stats row ────────────────────────
@@ -576,6 +580,81 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
           ),
         );
       },
+    );
+  }
+
+  // ── Voice link diagnostics ────────────────────────────────────────────────
+  // Shows exactly which stage of the ring→phone voice link is broken, so
+  // failures are never a silent black box again:
+  //   • not connected            → connection problem (see error text)
+  //   • connected, mic not armed → BLE notifications not enabled
+  //   • connected, MTU too small → ring audio (240B) cannot pass
+  //   • everything green         → speak, double-tap, done
+  Widget _buildVoiceLinkDiagnostics(bool isConn) {
+    final mtu = _ble.mtu;
+    final micArmed = _ble.micNotifyArmed;
+    final err = _ble.lastConnectionError;
+
+    String status;
+    Color color;
+    IconData icon;
+
+    if (!isConn) {
+      icon = Icons.error_outline;
+      if (err != null && err.isNotEmpty) {
+        color = _red;
+        status = 'Not connected — error: $err';
+      } else if (_connState == RingConnectionState.scanning ||
+          _connState == RingConnectionState.connecting) {
+        color = _amber;
+        status = 'Looking for the ring… (is it awake & not paired to another phone?)';
+      } else {
+        color = _amber;
+        status = 'Disconnected — tap Connect';
+      }
+    } else if (!micArmed) {
+      icon = Icons.error_outline;
+      color = _red;
+      status = 'Connected — but mic NOT enabled (voice will not work yet)';
+    } else if (mtu > 0 && mtu < 250) {
+      icon = Icons.warning_amber;
+      color = _red;
+        status =
+            'Connected — MTU $mtu is too small for voice (needs ~517). '
+            'Retrying MTU…';
+    } else {
+      icon = Icons.check_circle;
+      color = _green;
+      status = mtu > 0
+          ? 'Voice link ready — MTU $mtu · mic ON'
+          : 'Connected · mic ON';
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              status,
+              style: TextStyle(
+                color: color,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
     );
   }
 

@@ -1474,9 +1474,27 @@ class CaptionCallback : public NimBLECharacteristicCallbacks {
   }
 };
 
+// Tracks the negotiated ATT MTU of the phone connection.
+// Default 23 means a 240-byte audio notification would be SILENTLY DROPPED
+// by the NimBLE stack — the classic "ring says Listening, phone shows
+// nothing" failure. streamAudioChunk() sizes chunks to fit the MTU.
+static int lastAttMtu = 23;
+
+class ZeroServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    lastAttMtu = pServer->getAttMtu();
+    if (lastAttMtu < 23) lastAttMtu = 23;
+    Serial.printf("BLE connected (ATT MTU=%d)\n", lastAttMtu);
+  }
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    lastAttMtu = 23;
+  }
+};
+
 void setupBLE() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
   bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ZeroServerCallbacks(), true);
   NimBLEService* svc = bleServer->createService(SVC_UUID_MAIN);
 
   chrAudioUp   = svc->createCharacteristic(CHR_UUID_AUDIO_UP, NIMBLE_PROPERTY::NOTIFY);
@@ -1527,8 +1545,18 @@ void stopAudioStreamHold() {
 
 void streamAudioChunk() {
   static int16_t chunk[120]; // ~7.5ms @ 16kHz mono per BLE notification
+  // Size the notification to the negotiated MTU (max value = MTU - 3).
+  // With MTU 517 this is the full 240-byte fast path; with a small MTU the
+  // chunks shrink so they are never dropped (audio just streams slower).
+  int maxBytes = lastAttMtu - 3;
+  if (maxBytes < 2) maxBytes = 2;
+  int maxSamples = maxBytes / 2;
+  int capSamples = (int)(sizeof(chunk) / sizeof(chunk[0]));
+  if (maxSamples > capSamples) maxSamples = capSamples;
+  if (maxSamples < 1) maxSamples = 1;
+  size_t wantBytes = (size_t)maxSamples * sizeof(int16_t);
   size_t bytesRead = 0;
-  i2s_read(I2S_PORT_MIC, chunk, sizeof(chunk), &bytesRead, portMAX_DELAY);
+  i2s_read(I2S_PORT_MIC, chunk, wantBytes, &bytesRead, portMAX_DELAY);
   if (chrAudioUp && bytesRead > 0) {
     unsigned long sum = 0;
     size_t n = bytesRead / 2;

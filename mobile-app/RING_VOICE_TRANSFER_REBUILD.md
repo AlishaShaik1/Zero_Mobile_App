@@ -46,6 +46,30 @@ Kotlin RingBleHandler  ──►  Dart RingAudioPipeline  (only place voice is h
    marker (a session can no longer sit on "Listening…" forever).
 3. The older `firmware` copy gained the `0xFF`/`0xFE` markers it was missing.
 
+## Voice-link diagnostics card (below the connection card)
+
+The companion screen now shows **which stage of the link is broken**:
+
+| Screen says | Meaning |
+|---|---|
+| `Not connected — error: …` | BLE scan/connect failed — the error text says why (Bluetooth off, permissions, …) |
+| `Looking for the ring…` | Scanning. Ring must be awake and not connected to another phone |
+| `Connected — but mic NOT enabled` | GATT connected but NOTIFY enable failed — voice can't work until reconnect |
+| `Connected — MTU N too small` | 240-byte audio chunks can't pass; the app auto-retries MTU negotiation |
+| `Voice link ready — MTU 517 · mic ON` | Everything armed — double-tap and speak |
+
+Plus, while speaking, the green line shows `Ring audio received: X.Xs (N KB)` —
+live proof the ring's mic is physically reaching the phone.
+
+Known root causes fixed in this rebuild:
+- **MTU too small (23)**: Android BLE's default MTU cannot carry the ring's
+  240-byte PCM notifications — NimBLE drops them silently, so the 1-byte
+  "start" marker arrived (ring says Listening) but no audio ever reached the
+  phone. Now: MTU negotiation is verified + retried, reported to the UI, and
+  the firmware sizes chunks to the negotiated MTU as a safety net.
+- **Android 12+ scan finding nothing**: `BLUETOOTH_SCAN` now declared with
+  `neverForLocation` so scanning no longer depends on location permission.
+
 ## How to verify (no more blind "fixed" claims)
 
 1. **On-screen**: open Zero Ring companion screen, press **Start Listen**

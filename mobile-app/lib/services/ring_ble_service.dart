@@ -68,6 +68,14 @@ class RingDeviceDiscoveredEvent extends RingEvent {
   const RingDeviceDiscoveredEvent(this.device);
 }
 
+/// Diagnostic update (MTU negotiated, mic NOTIFY armed, …).
+/// Emitted so the companion screen can show the voice-link state live.
+class RingDiagnosticsEvent extends RingEvent {
+  final String key;
+  final String value;
+  const RingDiagnosticsEvent(this.key, this.value);
+}
+
 enum RingConnectionState { scanning, connecting, connected, disconnected }
 
 class DiscoveredRingDevice {
@@ -114,6 +122,20 @@ class RingBleService {
 
   String? _connectedDeviceAddress;
   String? get connectedDeviceAddress => _connectedDeviceAddress;
+
+  /// Negotiated ATT MTU (default 23 = voice audio cannot pass).
+  int _mtu = 0;
+  int get mtu => _mtu;
+
+  /// True once the mic characteristic NOTIFY is confirmed armed on the
+  /// Android side. Without this, ring audio never reaches the phone.
+  bool _micNotifyArmed = false;
+  bool get micNotifyArmed => _micNotifyArmed;
+
+  /// Last error reported by the native BLE layer (e.g. "bluetooth_disabled",
+  /// "SecurityException…") — shown on screen instead of a silent failure.
+  String? _lastConnectionError;
+  String? get lastConnectionError => _lastConnectionError;
 
   final Map<String, DiscoveredRingDevice> _discoveredDevices = {};
   List<DiscoveredRingDevice> get discoveredDevices =>
@@ -256,6 +278,9 @@ class RingBleService {
         _state = RingConnectionState.connected;
         _connectedDeviceName = (raw['name'] as String?) ?? 'Zero';
         _connectedDeviceAddress = raw['address'] as String?;
+        _lastConnectionError = null;
+        _mtu = 0;
+        _micNotifyArmed = false;
         _controller.add(
           RingConnectionEvent(
             RingConnectionState.connected,
@@ -265,10 +290,30 @@ class RingBleService {
         );
         _startForeground();
 
+      case 'mtu':
+        _mtu = (raw['mtu'] as int?) ?? 0;
+        debugPrint('[RingBle] Negotiated MTU: $_mtu');
+        _controller.add(RingDiagnosticsEvent('mtu', '$_mtu'));
+
+      case 'voice_link':
+        _micNotifyArmed = (raw['mic'] as bool?) ?? false;
+        debugPrint('[RingBle] Mic NOTIFY armed: $_micNotifyArmed');
+        _controller.add(
+          RingDiagnosticsEvent('mic_notify', _micNotifyArmed ? 'on' : 'off'),
+        );
+
       case 'disconnected':
         _state = RingConnectionState.disconnected;
         _connectedDeviceName = null;
         _connectedDeviceAddress = null;
+        _mtu = 0;
+        _micNotifyArmed = false;
+        // Surface the native error reason on screen instead of failing silently.
+        final err = raw['error'] as String?;
+        if (err != null && err.isNotEmpty) {
+          _lastConnectionError = err;
+          debugPrint('[RingBle] Connection error: $err');
+        }
         _controller.add(
           const RingConnectionEvent(RingConnectionState.disconnected),
         );
