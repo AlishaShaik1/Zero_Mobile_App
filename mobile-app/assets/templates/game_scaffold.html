@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+    <title>{{APP_TITLE}}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
+
+        body {
+            background: #0A0A0F;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+            touch-action: none;
+        }
+
+        #hud {
+            display: flex;
+            gap: 32px;
+            color: #00D4FF;
+            font-size: 13px;
+            letter-spacing: 2px;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+
+        #c {
+            border: 1px solid #252933;
+            border-radius: 2px;
+            image-rendering: pixelated;
+            max-width: min(98vw, 520px);
+            max-height: min(70vh, 520px);
+            width: min(98vw, 520px);
+            height: min(98vw, 520px);
+        }
+
+        #overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .88);
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 20;
+        }
+
+        #overlay h1 {
+            color: #fff;
+            font-size: clamp(20px, 5vw, 32px);
+            font-weight: 900;
+            letter-spacing: 2px;
+            margin-bottom: 6px
+        }
+
+        #overlay .sub {
+            color: #8892A4;
+            font-size: 13px;
+            margin-bottom: 24px
+        }
+
+        #overlay .score {
+            color: #00D4FF;
+            font-size: 18px;
+            font-weight: 700;
+            margin-bottom: 20px
+        }
+
+        .btn {
+            background: #00D4FF;
+            color: #000;
+            border: none;
+            padding: 10px 32px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 800;
+            cursor: pointer;
+            letter-spacing: 1px;
+            font-family: inherit;
+            transition: opacity .15s;
+        }
+
+        .btn:hover {
+            opacity: .85
+        }
+
+        #msg {
+            position: fixed;
+            top: 14px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #1a1d24;
+            border: 1px solid #252933;
+            border-radius: 6px;
+            padding: 6px 16px;
+            font-size: 12px;
+            color: #fff;
+            z-index: 30;
+            display: none;
+        }
+
+        /* mobile d-pad */
+        #dpad {
+            display: none;
+            margin-top: 14px;
+            display: grid;
+            grid-template-areas: ". u ." "l . r" ". d .";
+            gap: 4px;
+        }
+
+        @media(pointer:coarse) {
+            #dpad {
+                display: grid
+            }
+        }
+
+        .dpad-btn {
+            width: 44px;
+            height: 44px;
+            background: #1a1d24;
+            border: 1px solid #252933;
+            border-radius: 6px;
+            color: #8892A4;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+        }
+
+        .dpad-btn:active {
+            background: #252933;
+            color: #fff
+        }
+
+        #dpad-u {
+            grid-area: u
+        }
+
+        #dpad-l {
+            grid-area: l
+        }
+
+        #dpad-d {
+            grid-area: d
+        }
+
+        #dpad-r {
+            grid-area: r
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="hud">
+        <span>SCORE&nbsp;<span id="score">0</span></span>
+        <span>BEST&nbsp;<span id="best">0</span></span>
+        <span id="level-hud" style="display:none">LEVEL&nbsp;<span id="level">1</span></span>
+    </div>
+
+    <canvas id="c"></canvas>
+
+    <!-- Mobile d-pad -->
+    <div id="dpad">
+        <div class="dpad-btn" id="dpad-u" onpointerdown="dpadPress('ArrowUp')">▲</div>
+        <div class="dpad-btn" id="dpad-l" onpointerdown="dpadPress('ArrowLeft')">◀</div>
+        <div class="dpad-btn" id="dpad-d" onpointerdown="dpadPress('ArrowDown')">▼</div>
+        <div class="dpad-btn" id="dpad-r" onpointerdown="dpadPress('ArrowRight')">▶</div>
+    </div>
+
+    <!-- Game Over / Start overlay -->
+    <div id="overlay">
+        <h1 id="overlay-title">GAME OVER</h1>
+        <div class="sub" id="overlay-sub">Press SPACE or tap to restart</div>
+        <div class="score" id="overlay-score"></div>
+        <button class="btn" onclick="restartGame()">PLAY AGAIN</button>
+    </div>
+
+    <!-- Flash message -->
+    <div id="msg"></div>
+
+    <!-- ZERO BADGE (always visible) -->
+    <a href="https://zeroai.app" target="_blank" style="position:fixed;bottom:10px;right:10px;z-index:99;
+          background:#0c0e14;border:1px solid #252933;border-radius:7px;
+          padding:5px 10px;display:flex;align-items:center;gap:6px;
+          text-decoration:none;font-size:10px;font-family:monospace;color:#6b7280">
+        <svg width="14" height="14" viewBox="0 0 26 26">
+            <rect x="6" y="3" width="14" height="14" rx="1" fill="white" stroke="black" stroke-width="1" />
+            <rect x="9" y="7" width="2" height="2" fill="#1E88E5" />
+            <rect x="13" y="7" width="2" height="2" fill="#1E88E5" />
+            <rect x="9" y="17" width="3" height="4" fill="black" />
+            <rect x="14" y="17" width="3" height="4" fill="black" />
+        </svg>
+        Built with <strong style="color:#00D4FF">ZERO</strong>
+    </a>
+
+    <script>
+        // ══════════════════════════════════════════════════════════
+        //  ZERO GAME ENGINE  —  pre-baked boilerplate, zero tokens
+        // ══════════════════════════════════════════════════════════
+        const canvas = document.getElementById('c');
+        const ctx = canvas.getContext('2d');
+        const scoreEl = document.getElementById('score');
+        const bestEl = document.getElementById('best');
+        const overlay = document.getElementById('overlay');
+        const oScore = document.getElementById('overlay-score');
+        const oTitle = document.getElementById('overlay-title');
+        const msgEl = document.getElementById('msg');
+
+        // ── canvas sizing ─────────────────────────────────────────
+        function resizeCanvas() {
+            const s = Math.min(window.innerWidth * 0.98, window.innerHeight * 0.68, 520);
+            canvas.width = Math.floor(s);
+            canvas.height = Math.floor(s);
+            if (typeof onResize === 'function') onResize(canvas.width, canvas.height);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // ── score tracking ────────────────────────────────────────
+        let _score = 0, _level = 1;
+        let _best = parseInt(localStorage.getItem('zg_best') || '0');
+        bestEl.textContent = _best;
+
+        function setScore(n) {
+            _score = n; scoreEl.textContent = n;
+            if (n > _best) { _best = n; bestEl.textContent = n; localStorage.setItem('zg_best', n); }
+        }
+        function getScore() { return _score; }
+        function addScore(n) { setScore(_score + n); }
+
+        function setLevel(n) {
+            _level = n;
+            document.getElementById('level').textContent = n;
+            document.getElementById('level-hud').style.display = '';
+        }
+
+        // ── overlay helpers ───────────────────────────────────────
+        function showOverlay(title, sub) {
+            oTitle.textContent = title || 'GAME OVER';
+            document.getElementById('overlay-sub').textContent = sub || 'Tap to restart';
+            oScore.textContent = 'Score: ' + _score;
+            overlay.style.display = 'flex';
+        }
+        function hideOverlay() { overlay.style.display = 'none'; }
+
+        function flashMsg(text, ms = 1800) {
+            msgEl.textContent = text; msgEl.style.display = 'block';
+            clearTimeout(flashMsg._t);
+            flashMsg._t = setTimeout(() => msgEl.style.display = 'none', ms);
+        }
+
+        // ── keyboard ──────────────────────────────────────────────
+        const keys = {};
+        document.addEventListener('keydown', e => {
+            keys[e.key] = true;
+            if (typeof onKey === 'function') onKey(e.key, true);
+            if ((e.key === ' ' || e.key === 'Enter') && overlay.style.display !== 'none') restartGame();
+            if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+        });
+        document.addEventListener('keyup', e => {
+            keys[e.key] = false;
+            if (typeof onKey === 'function') onKey(e.key, false);
+        });
+
+        // ── touch / swipe ─────────────────────────────────────────
+        let _tx = 0, _ty = 0;
+        canvas.addEventListener('touchstart', e => {
+            _tx = e.touches[0].clientX; _ty = e.touches[0].clientY;
+            if (overlay.style.display !== 'none') { restartGame(); return; }
+        }, { passive: true });
+        canvas.addEventListener('touchend', e => {
+            const dx = e.changedTouches[0].clientX - _tx;
+            const dy = e.changedTouches[0].clientY - _ty;
+            if (Math.abs(dx) < 8 && Math.abs(dy) < 8) {
+                if (typeof onTap === 'function') onTap(_tx, _ty);
+                return;
+            }
+            const dir = Math.abs(dx) > Math.abs(dy)
+                ? (dx > 0 ? 'ArrowRight' : 'ArrowLeft')
+                : (dy > 0 ? 'ArrowDown' : 'ArrowUp');
+            if (typeof onSwipe === 'function') onSwipe(dir);
+            if (typeof onKey === 'function') onKey(dir, true);
+        }, { passive: true });
+
+        canvas.addEventListener('click', e => {
+            if (typeof onTap === 'function') onTap(e.offsetX, e.offsetY);
+        });
+
+        function dpadPress(key) {
+            if (typeof onKey === 'function') onKey(key, true);
+            if (typeof onSwipe === 'function') onSwipe(key);
+        }
+
+        // ── RAF loop manager ──────────────────────────────────────
+        let _raf = null;
+        let _last = 0;
+        let _running = false;
+
+        function startLoop() {
+            _running = true; _last = 0;
+            function tick(ts) {
+                if (!_running) return;
+                const dt = _last ? Math.min((ts - _last) / 1000, 0.05) : 0.016;
+                _last = ts;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                update(dt);
+                draw(ctx, canvas.width, canvas.height);
+                _raf = requestAnimationFrame(tick);
+            }
+            _raf = requestAnimationFrame(tick);
+        }
+        function stopLoop() { _running = false; cancelAnimationFrame(_raf); }
+
+        // ── drawing utils (pixel-art friendly) ───────────────────
+        function fillRect(x, y, w, h, col) { ctx.fillStyle = col; ctx.fillRect(x, y, w, h); }
+        function strokeRect(x, y, w, h, col, lw = 1) {
+            ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.strokeRect(x + .5, y + .5, w, h);
+        }
+        function fillText(txt, x, y, col, size = 14, align = 'left', font = 'monospace') {
+            ctx.fillStyle = col; ctx.font = `${size}px ${font}`; ctx.textAlign = align;
+            ctx.fillText(txt, x, y);
+        }
+        function clearCanvas(col = '#0A0A0F') { fillRect(0, 0, canvas.width, canvas.height, col); }
+
+        // ── math utils ───────────────────────────────────────────
+        function rng(min, max) { return Math.random() * (max - min) + min; }
+        function rngInt(min, max) { return Math.floor(rng(min, max + 1)); }
+        function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+        function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+        function lerp(a, b, t) { return a + (b - a) * t; }
+
+        // ══════════════════════════════════════════════════════════
+        //  GAME-SPECIFIC CODE  (AI fills this section only)
+        // ══════════════════════════════════════════════════════════
+        { { GAME_LOGIC } }
+        //  END GAME CODE
+        // ══════════════════════════════════════════════════════════
+    </script>
+</body>
+
+</html>
