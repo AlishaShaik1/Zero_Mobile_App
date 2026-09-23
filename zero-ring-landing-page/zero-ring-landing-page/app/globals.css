@@ -1,0 +1,142 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #F4F3EF;
+  --foreground: #0A0A0A;
+  --card: #FFFFFF;
+  --card-foreground: #0A0A0A;
+  --primary: #0A0A0A;
+  --primary-foreground: #FFFFFF;
+  --muted-foreground: #666660;
+  --border: #0A0A0A;
+  --ring: #00C8FF;
+  --radius: 0.625rem;
+
+  /* Zero tokens */
+  --zero-bg:     #F4F3EF;
+  --zero-surface: #FFFFFF;
+  --zero-ink:    #0A0A0A;
+  --zero-muted:  #666660;
+  --zero-cyan:   #00C8FF;
+}
+
+@theme inline {
+  --font-sans: var(--font-space-grotesk), 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: var(--font-space-mono), 'Space Mono', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    outline-color: #00C8FF;
+  }
+  body {
+    background: var(--zero-bg);
+    color: var(--zero-ink);
+    font-family: var(--font-space-grotesk), system-ui, sans-serif;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  html {
+    overflow-x: hidden;
+    scroll-behavior: smooth;
+  }
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: #F4F3EF; }
+  ::-webkit-scrollbar-thumb { background: #CCCCCC; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #00C8FF; }
+}
+
+/* ── Blink cursor ── */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.blink-cursor { animation: blink 1s step-end infinite; }
+
+/* ── Float ── */
+@keyframes float {
+  0%,100% { transform: translateY(0px); }
+  50%      { transform: translateY(-12px); }
+}
+.float-anim { animation: float 5s ease-in-out infinite; }
+
+/* ── Section divider ── */
+.section-divider { height: 2px; background: #0A0A0A; }
+
+/* ── Code Syntax Highlighting (ChatGPT / One Dark Pro Theme) ── */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-subst {
+  color: #C678DD !important; /* purple / pink */
+  font-weight: 600;
+}
+
+.hljs-string,
+.hljs-addition,
+.hljs-meta .hljs-string {
+  color: #98C379 !important; /* emerald green */
+}
+
+.hljs-function,
+.hljs-title.function_,
+.hljs-attr {
+  color: #61AFEF !important; /* sky blue */
+}
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-type,
+.hljs-built_in {
+  color: #E5C07B !important; /* golden yellow */
+}
+
+.hljs-number,
+.hljs-literal {
+  color: #D19A66 !important; /* orange / coral */
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: #7F848E !important; /* slate grey */
+  font-style: italic;
+}
+
+.hljs-meta,
+.hljs-meta-keyword,
+.hljs-meta-string {
+  color: #E06C75 !important; /* preprocessor / red */
+}
+
+.hljs-variable,
+.hljs-template-variable {
+  color: #E06C75 !important;
+}
+
+.hljs-operator,
+.hljs-punctuation {
+  color: #ABB2BF !important;
+}
+
+/* ── Hide Next.js Dev Indicator Badge ("N") ── */
+nextjs-portal,
+#nextjs-dev-overlay,
+[data-nextjs-dev-indicator],
+[data-nextjs-toast],
+[data-nextjs-toast-wrapper],
+[data-nextjs-dialog-overlay] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}

@@ -1,0 +1,6 @@
+{
+  "appId": "com.zeroring.app",
+  "appName": "Zero Ring Companion",
+  "webDir": "out",
+  "bundledWebRuntime": false
+}

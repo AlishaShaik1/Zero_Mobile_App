@@ -1,0 +1,61 @@
+# Compiled Mobile Application Artifacts (>100MB exceeds GitHub limit)
+*.apk
+*.aab
+*.ipa
+
+# Node / Web / Next.js
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+**/out/
+.vercel/
+**/.vercel/
+.turbo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# Environment & Secret files
+.env
+.env*.local
+**/.env*.local
+
+# Android & Gradle
+.gradle/
+**/.gradle/
+build/
+**/build/
+local.properties
+*.keystore
+*.jks
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.git_nested_backup
+.git_nested_backup/
+
+# Log and debug text outputs
+*.log
+errors.txt
+tsc_errors.log
+
+# Arduino / PlatformIO / Hardware build caches
+.pio/
+.pioenvs/
+.piolibdeps/
