@@ -133,7 +133,14 @@ class RingBleService {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+  bool _initialized = false;
+
   Future<void> initialize() async {
+    // Guard: without this, calling initialize() from both main.dart and the
+    // ring screens subscribes to the EventChannel TWICE and every audio
+    // chunk gets delivered twice — which silently broke voice transfer.
+    if (_initialized) return;
+    _initialized = true;
     _setupForegroundTask();
     _listenNative();
   }
@@ -213,9 +220,18 @@ class RingBleService {
         }
 
       case 'audio':
+        // Kotlin sends a ByteArray; depending on codec version it can arrive
+        // as Uint8List OR plain List<int>. Accept any int list so a codec
+        // difference can never silently drop the ring's voice again.
         final data = raw['data'];
         if (data is Uint8List && data.isNotEmpty) {
           _controller.add(RingAudioChunk(data));
+        } else if (data is List && data.isNotEmpty) {
+          _controller.add(
+            RingAudioChunk(
+              Uint8List.fromList(data.map((e) => (e as num).toInt()).toList()),
+            ),
+          );
         }
 
       case 'media_header':

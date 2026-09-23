@@ -4,35 +4,33 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
-import android.content.Intent
-import android.os.Build
-import android.os.ParcelFileDescriptor
 import android.util.Log
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * BackgroundRingProcessor — Handles the full ring pipeline entirely in Kotlin/native
- * when the Flutter app is backgrounded (screen off, app minimized).
+ * BackgroundRingProcessor — rebuilt FROM SCRATCH (voice transfer only).
  *
- * Flow: Ring double-click (0xFF BLE marker)
- *   → collect PCM chunks from BLE
- *   → feed into Android SpeechRecognizer via ParcelFileDescriptor pipe (Android 13+)
- *   → NO phone mic, NO speaker output
- *   → transcript text → Fireworks GLM-5P3-Flash REST API (OkHttp)
- *   → short reply caption → write to ring OLED via BLE
- *   → optionally wake Flutter app to display in chat screen
+ * Handles the full ring → phone voice pipeline entirely in Kotlin/native when
+ * the Flutter app is backgrounded (screen off, app minimized):
  *
- * When app is in FOREGROUND: this class defers to Dart pipeline (does nothing).
- * When app is in BACKGROUND: this class handles everything natively.
+ *   Ring mic audio (0xFF marker, PCM chunks, 0xFE marker) via BLE
+ *     → collect PCM natively
+ *     → cloud STT (Deepgram REST — NO Android SpeechRecognizer, so there is
+ *       no "speech service not installed" failure mode)
+ *     → Fireworks GLM-5P3-Flash REST (OkHttp)
+ *     → short reply caption → ring OLED via BLE
+ *
+ * When the app is in FOREGROUND: this class does nothing — the Dart
+ * RingAudioPipeline owns the voice transfer (same protocol, same STT).
+ *
+ * Everything else (BLE connection, camera, captions) is untouched.
  */
 class BackgroundRingProcessor(
     private val context: Context,
@@ -43,8 +41,16 @@ class BackgroundRingProcessor(
         private const val SAMPLE_RATE = 16000
         private const val BYTES_PER_SAMPLE = 2
         private const val MIN_SPEECH_BYTES = 16000   // 0.5s minimum
-        private const val MAX_SPEECH_BYTES = 480000  // 15s maximum
+        private const val MAX_SPEECH_BYTES = 960000  // 30s maximum
         private const val SILENCE_TIMEOUT_MS = 2500L
+
+        // Deepgram cloud STT — two keys tried in order (same as Dart side),
+        // so one expired key cannot kill the feature.
+        private val DEEPGRAM_KEYS = listOf(
+            "bf8e5c0fbe1d38a88cda424c00213dc8e0e70fc0",
+            "36dd865f774bfe84b2044e54f9b7c3f175a10634"
+        )
+        private val DEEPGRAM_MODELS = listOf("nova-3", "nova-2")
 
         private const val FW_API_KEY = "fw_3iUKfhBn2vryacJynHPsUU"
         private const val FW_MODEL   = "accounts/fireworks/models/glm-5p3-flash"
@@ -59,7 +65,7 @@ class BackgroundRingProcessor(
     private val executor     = Executors.newSingleThreadExecutor()
     private val httpClient   = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
         .build()
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -69,47 +75,40 @@ class BackgroundRingProcessor(
 
     private val pcmBuffer = java.io.ByteArrayOutputStream()
     private var silenceTimer: Runnable? = null
-
-    // STT (Android 13+)
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var pipeFds: Array<ParcelFileDescriptor>? = null
-    private var pipeOut: FileOutputStream? = null
     private var finalTranscript = ""
-    private var partialTranscript = ""
     private val transcriptLock = Object()
 
     // Wake lock to keep CPU alive during background processing
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // ── App foreground/background tracking ───────────────────────────────────
+    // ── App foreground/background tracking ────────────────────────────────────
 
     fun onAppForeground() { isAppForeground = true }
     fun onAppBackground()  { isAppForeground = false }
 
-    // ── Called by RingBleHandler for every audio chunk ───────────────────────
+    // ── Called by RingBleHandler for every ring mic chunk ─────────────────────
 
     /**
      * Route a BLE audio notification.
-     * Called from RingBleHandler.routeNotification when uuid == CHAR_MIC_AUDIO.
      * If app is foreground → Dart pipeline handles it (return immediately).
-     * If app is background → we handle it natively here.
+     * If app is background → we handle the whole voice transfer natively here.
      */
     fun onAudioChunk(bytes: ByteArray) {
         if (isAppForeground) return  // Dart handles it
 
-        // 0xFF = double-click start marker
+        // 0xFF = start marker
         if (bytes.size == 1 && bytes[0] == 0xFF.toByte()) {
             if (!isCollecting && !isProcessing) {
-                Log.i(TAG, "🔴 Background double-click: starting ring mic STT pipeline")
+                Log.i(TAG, "Background: ring mic START — collecting PCM")
                 startBackgroundListening()
             }
             return
         }
 
-        // 0xFE = single-click stop marker
+        // 0xFE = stop marker
         if (bytes.size == 1 && bytes[0] == 0xFE.toByte()) {
             if (isCollecting) {
-                Log.i(TAG, "🟡 Background single-click: finalizing speech")
+                Log.i(TAG, "Background: ring mic STOP — transcribing")
                 triggerFinalize()
             }
             return
@@ -117,14 +116,7 @@ class BackgroundRingProcessor(
 
         if (!isCollecting || bytes.isEmpty()) return
 
-        synchronized(pcmBuffer) {
-            pcmBuffer.write(bytes)
-        }
-
-        // Feed into STT pipe at real-time rate
-        feedPipe(bytes)
-
-        // Push PCM to pipe for STT (real-time paced in executor)
+        synchronized(pcmBuffer) { pcmBuffer.write(bytes) }
         resetSilenceTimer()
 
         // Stop if exceeded max
@@ -141,151 +133,118 @@ class BackgroundRingProcessor(
         acquireWakeLock()
         isCollecting  = true
         isProcessing  = false
-        finalTranscript   = ""
-        partialTranscript = ""
+        finalTranscript = ""
         synchronized(pcmBuffer) { pcmBuffer.reset() }
 
-        // Write THINKING status to ring OLED immediately
+        // Immediate feedback on the ring OLED
         ringBle.writeCaption("Listening...")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            startSttPipe()
-        } else {
-            // Android < 13: ParcelFD not supported; just collect PCM, skip STT
-            Log.w(TAG, "Android < 13: skipping on-device STT, will use transcript from silence")
-        }
-    }
-
-    private fun startSttPipe() {
-        mainHandler.post {
-            try {
-                val fds = ParcelFileDescriptor.createPipe()
-                pipeFds = fds
-                pipeOut = FileOutputStream(fds[1].fileDescriptor)
-
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                    setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(p: android.os.Bundle?) {
-                            Log.d(TAG, "STT ready (background pipe)")
-                        }
-                        override fun onBeginningOfSpeech() {}
-                        override fun onRmsChanged(rms: Float) {}
-                        override fun onBufferReceived(buf: ByteArray?) {}
-                        override fun onEndOfSpeech() { isCollecting = false }
-                        override fun onError(err: Int) {
-                            Log.e(TAG, "Background STT error: $err")
-                            // Finalize with whatever partial we have
-                            synchronized(transcriptLock) {
-                                if (finalTranscript.isEmpty()) finalTranscript = partialTranscript
-                            }
-                            processTranscript()
-                        }
-                        override fun onResults(bundle: android.os.Bundle?) {
-                            val list = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val text = list?.firstOrNull() ?: ""
-                            Log.i(TAG, "Background STT final: \"$text\"")
-                            synchronized(transcriptLock) { finalTranscript = text }
-                            cleanupStt()
-                            processTranscript()
-                        }
-                        override fun onPartialResults(bundle: android.os.Bundle?) {
-                            val list = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val text = list?.firstOrNull() ?: ""
-                            if (text.isNotEmpty()) {
-                                Log.d(TAG, "Background STT partial: \"$text\"")
-                                synchronized(transcriptLock) { partialTranscript = text }
-                            }
-                        }
-                        override fun onEvent(t: Int, p: android.os.Bundle?) {}
-                        override fun onSegmentResults(b: android.os.Bundle) {}
-                        override fun onEndOfSegmentedSession() {}
-                        override fun onLanguageDetection(b: android.os.Bundle) {}
-                    })
-                }
-
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, fds[0])
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
-                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
-                }
-                speechRecognizer?.startListening(intent)
-                Log.d(TAG, "Background STT pipe started")
-            } catch (e: Exception) {
-                Log.e(TAG, "Background STT start failed: ${e.message}", e)
-            }
-        }
-    }
-
-    private fun feedPipe(pcm: ByteArray) {
-        executor.submit {
-            try {
-                pipeOut?.write(pcm)
-                pipeOut?.flush()
-                // Real-time pacing
-                val ms = (pcm.size.toLong() * 1000) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                if (ms > 0) Thread.sleep(ms)
-            } catch (_: Exception) {}
-        }
     }
 
     private fun resetSilenceTimer() {
-        mainHandler.removeCallbacks(silenceTimerRunnable)
-        mainHandler.postDelayed(silenceTimerRunnable, SILENCE_TIMEOUT_MS)
-    }
-
-    private val silenceTimerRunnable = Runnable {
-        val buffered = synchronized(pcmBuffer) { pcmBuffer.size() }
-        if (buffered >= MIN_SPEECH_BYTES) {
-            Log.i(TAG, "Background silence detected → finalizing ($buffered bytes)")
-            triggerFinalize()
+        silenceTimer?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            val buffered = synchronized(pcmBuffer) { pcmBuffer.size() }
+            if (isCollecting && buffered >= MIN_SPEECH_BYTES) {
+                Log.i(TAG, "Background silence detected → finalizing ($buffered bytes)")
+                triggerFinalize()
+            }
         }
+        silenceTimer = r
+        mainHandler.postDelayed(r, SILENCE_TIMEOUT_MS)
     }
 
     private fun triggerFinalize() {
+        if (!isCollecting) return  // idempotent
         isCollecting = false
-        mainHandler.removeCallbacks(silenceTimerRunnable)
+        silenceTimer?.let { mainHandler.removeCallbacks(it) }
+        silenceTimer = null
 
-        // Close write end → SpeechRecognizer sees EOF → fires onResults
+        val pcm = synchronized(pcmBuffer) { pcmBuffer.toByteArray() }
+        if (pcm.size < MIN_SPEECH_BYTES) {
+            Log.i(TAG, "Background: only ${pcm.size} bytes — too short, ignoring")
+            releaseWakeLock()
+            return
+        }
+
+        Log.i(TAG, "Background: ${pcm.size} bytes PCM → Deepgram REST")
         executor.submit {
             try {
-                pipeOut?.close()
-                pipeOut = null
-                pipeFds?.getOrNull(1)?.close()
-            } catch (_: Exception) {}
-        }
-
-        // Fallback: if no STT results in 6s, process with whatever partial we have
-        mainHandler.postDelayed({
-            val transcript = synchronized(transcriptLock) {
-                if (finalTranscript.isEmpty()) partialTranscript else ""
-            }
-            if (transcript.isNotEmpty() && !isProcessing) {
-                Log.w(TAG, "STT timeout fallback — using partial: \"$transcript\"")
+                val transcript = transcribeWithDeepgram(pcm)
                 synchronized(transcriptLock) { finalTranscript = transcript }
-                cleanupStt()
                 processTranscript()
+            } catch (e: Exception) {
+                Log.e(TAG, "Background pipeline error: ${e.message}", e)
+                ringBle.writeCaption("Error: try again")
+                isProcessing = false
+                releaseWakeLock()
             }
-        }, 6000)
-    }
-
-    private fun cleanupStt() {
-        try { pipeOut?.close() } catch (_: Exception) {}
-        try { pipeFds?.get(0)?.close() } catch (_: Exception) {}
-        try { pipeFds?.get(1)?.close() } catch (_: Exception) {}
-        pipeOut  = null
-        pipeFds  = null
-        mainHandler.post {
-            speechRecognizer?.destroy()
-            speechRecognizer = null
         }
     }
 
-    // ── GLM API call + caption write ─────────────────────────────────────────
+    // ── Cloud STT (no on-device speech service needed) ────────────────────────
+
+    /** Wrap raw 16 kHz mono 16-bit LE PCM in a 44-byte WAV header. */
+    private fun buildWav(pcm: ByteArray): ByteArray {
+        val dataSize = pcm.size
+        val out = ByteArray(44 + dataSize)
+        out[0] = 'R'.code.toByte(); out[1] = 'I'.code.toByte()
+        out[2] = 'F'.code.toByte(); out[3] = 'F'.code.toByte()
+        val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+        bb.putInt(4, 36 + dataSize)
+        out[8] = 'W'.code.toByte(); out[9] = 'A'.code.toByte()
+        out[10] = 'V'.code.toByte(); out[11] = 'E'.code.toByte()
+        out[12] = 'f'.code.toByte(); out[13] = 'm'.code.toByte()
+        out[14] = 't'.code.toByte(); out[15] = ' '.code.toByte()
+        bb.putInt(16, 16)                     // fmt chunk size
+        bb.putShort(20, 1.toShort())          // PCM format
+        bb.putShort(22, 1.toShort())          // mono
+        bb.putInt(24, SAMPLE_RATE)
+        bb.putInt(28, SAMPLE_RATE * BYTES_PER_SAMPLE)
+        bb.putShort(32, BYTES_PER_SAMPLE.toShort())
+        bb.putShort(34, 16.toShort())         // bits per sample
+        out[36] = 'd'.code.toByte(); out[37] = 'a'.code.toByte()
+        out[38] = 't'.code.toByte(); out[39] = 'a'.code.toByte()
+        bb.putInt(40, dataSize)
+        pcm.copyInto(out, 44)
+        return out
+    }
+
+    /** POST WAV to Deepgram; tries keys × models in order. Empty on failure. */
+    private fun transcribeWithDeepgram(pcm: ByteArray): String {
+        val wav = buildWav(pcm)
+        for (key in DEEPGRAM_KEYS) {
+            for (model in DEEPGRAM_MODELS) {
+                try {
+                    val request = Request.Builder()
+                        .url(
+                            "https://api.deepgram.com/v1/listen?model=${model}" +
+                                "&smart_format=true&language=en-US"
+                        )
+                        .addHeader("Authorization", "Token $key")
+                        .addHeader("Content-Type", "audio/wav")
+                        .post(wav.toRequestBody("audio/wav".toMediaType()))
+                        .build()
+                    val resp = httpClient.newCall(request).execute()
+                    val body = resp.body?.string() ?: ""
+                    if (resp.isSuccessful) {
+                        val text = JSONObject(body)
+                            .optJSONObject("results")
+                            ?.optJSONArray("channels")?.optJSONObject(0)
+                            ?.optJSONArray("alternatives")?.optJSONObject(0)
+                            ?.optString("transcript")?.trim() ?: ""
+                        Log.i(TAG, "Deepgram transcript (key ok, $model): \"$text\"")
+                        return text
+                    }
+                    Log.w(TAG, "Deepgram HTTP ${resp.code}: ${body.take(200)}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Deepgram error: ${e.message}")
+                }
+            }
+        }
+        return ""
+    }
+
+    // ── GLM API call + caption write ──────────────────────────────────────────
 
     private fun processTranscript() {
         if (isProcessing) return
@@ -294,23 +253,23 @@ class BackgroundRingProcessor(
         val transcript = synchronized(transcriptLock) { finalTranscript.trim() }
         if (transcript.isEmpty()) {
             Log.w(TAG, "Background: empty transcript — skipping")
-            releaseWakeLock()
+            ringBle.writeCaption("Did not hear you")
             isProcessing = false
+            releaseWakeLock()
             return
         }
 
-        Log.i(TAG, "Background 🎤 Transcript: \"$transcript\"")
+        Log.i(TAG, "Background Transcript: \"$transcript\"")
         ringBle.writeCaption("Thinking...")
 
         executor.submit {
             try {
                 val reply = callFireworksGlm(transcript)
-                Log.i(TAG, "Background 🤖 GLM reply: \"$reply\"")
+                Log.i(TAG, "Background GLM reply: \"$reply\"")
 
-                // Send caption to ring OLED (max 20 chars visible)
+                // Send caption to ring OLED
                 val caption = if (reply.length > 60) reply.substring(0, 57) + "..." else reply
                 ringBle.writeCaption(caption)
-
             } catch (e: Exception) {
                 Log.e(TAG, "Background processing error: ${e.message}", e)
                 ringBle.writeCaption("Error: try again")
@@ -354,7 +313,6 @@ class BackgroundRingProcessor(
             Log.e(TAG, "GLM API error ${resp.code}: $respBody")
             return "I couldn't process that."
         }
-
         val json = JSONObject(respBody)
         return json.getJSONArray("choices")
             .getJSONObject(0)
@@ -370,14 +328,16 @@ class BackgroundRingProcessor(
             val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
             if (wakeLock == null || wakeLock?.isHeld == false) {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZeroRing:BackgroundSTT")
-                wakeLock?.acquire(30_000L) // 30s max for one utterance
+                wakeLock?.acquire(60_000L) // 60s max for one utterance
             }
         } catch (e: Exception) { Log.w(TAG, "WakeLock acquire failed: ${e.message}") }
     }
 
     private fun releaseWakeLock() {
         try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
         } catch (_: Exception) {}
     }
 }

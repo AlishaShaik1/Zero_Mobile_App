@@ -41,9 +41,6 @@ class MainActivity: FlutterActivity() {
     // ── Zero Ring BLE handler ──────────────────────────────────────────────
     private val ringBle by lazy { RingBleHandler(this) }
 
-    // ── Zero Ring on-device STT handler (ring PCM → SpeechRecognizer pipe) ──
-    private val ringStt by lazy { RingSttHandler(this) }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         // Screen wake triggers
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -108,15 +105,8 @@ class MainActivity: FlutterActivity() {
         val bleEventChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.example.zero_ring/ble_events")
         ringBle.setupChannels(bleMethodChannel, bleEventChannel)
 
-        // ── Wire Ring STT Channels (ring PCM → ParcelFD pipe → SpeechRecognizer) ──
-        val sttMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.example.zero_ring/stt")
-        val sttEventChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.example.zero_ring/stt_events")
-        ringStt.setupMethodChannel(sttMethodChannel)
-        ringStt.setupEventChannel(sttEventChannel)
-
         // ── Init background ring processor (handles pipeline when screen is off) ──
         ringBle.backgroundProcessor = BackgroundRingProcessor(this, ringBle)
-        ringBle.ringStt = ringStt
 
         // Handle cold boot trigger
         if (intent?.getBooleanExtra("wake_live_voice", false) == true) {

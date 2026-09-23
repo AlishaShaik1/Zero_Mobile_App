@@ -48,10 +48,12 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
       _transcriptSub,
       _aiResponseSub,
       _energySub,
-      _stateSub;
+      _stateSub,
+      _diagSub;
 
   RingConnectionState _connState = RingConnectionState.disconnected;
-  String _latestTranscript = 'Double-tap ring to speak…';
+  String _latestTranscript = 'Hold ring button 2s to speak…';
+  String _ringAudioDiag = ''; // live proof that ring audio is arriving
   String _latestAiResponse = 'AI response will appear here.';
   String _currentCaption = '';
   double _audioEnergy = 0.0;
@@ -181,7 +183,16 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
       if (mounted) {
         setState(() {
           _isListening = s == RingPipelineState.listening;
+          // Clear the live audio counter once a session is done.
+          if (s == RingPipelineState.idle) _ringAudioDiag = '';
         });
+      }
+    });
+
+    // Live proof that ring audio is actually arriving (seconds + KB).
+    _diagSub = _audioPipeline.diagnostics.listen((d) {
+      if (mounted && d.isNotEmpty) {
+        setState(() => _ringAudioDiag = d);
       }
     });
 
@@ -213,6 +224,7 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
     _aiResponseSub?.cancel();
     _energySub?.cancel();
     _stateSub?.cancel();
+    _diagSub?.cancel();
     _textCtrl.dispose();
     _queryFocus.dispose();
     super.dispose();
@@ -645,7 +657,9 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
                 const SizedBox(height: 4),
                 Expanded(
                   child: Text(
-                    _currentCaption.isNotEmpty ? _currentCaption : '2x: speak',
+                    _currentCaption.isNotEmpty
+                        ? _currentCaption
+                        : '2x: speak',
                     style: const TextStyle(
                       fontFamily: 'monospace',
                       color: Colors.white70,
@@ -845,6 +859,43 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
             ),
           ),
 
+          // Live ring-audio link status — proves the ring's mic audio is
+          // physically reaching the phone (fixes the "is it even receiving?"
+          // black box that made every earlier fix unverifiable).
+          if (_audioPipeline.isStreamingFromRing || _ringAudioDiag.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: _green.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: _green.withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.graphic_eq,
+                    size: 12,
+                    color: _green,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _ringAudioDiag.isNotEmpty
+                          ? _ringAudioDiag
+                          : 'Waiting for ring audio…',
+                      style: const TextStyle(
+                        color: _green,
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: 14),
 
           // Transcript → AI response
@@ -869,17 +920,37 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
             children: [
               Expanded(
                 child: _actionButton(
-                  label: isStreaming ? 'Process Speech' : 'Start Listen',
+                  label: isStreaming ? 'Stop & Send' : 'Start Listen',
                   icon: isStreaming ? Icons.stop_circle : Icons.mic_none,
                   color: isStreaming ? _red : _green,
-                  onTap: () {
+                  onTap: () async {
+                    // ── RING mic (preferred — this is ring→phone voice) ──────
+                    if (isConn && !isStreaming) {
+                      setState(() {
+                        _latestTranscript = 'Starting ring mic…';
+                        _ringAudioDiag = '';
+                      });
+                      final started =
+                          await _audioPipeline.startRingMicFromPhone();
+                      if (!started) {
+                        // Ring dropped mid-way → fall back to phone mic.
+                        setState(() => _latestTranscript = 'Listening...');
+                        _audioPipeline.triggerManualSpeechStart();
+                      }
+                      return;
+                    }
+                    // ── Stop a running ring-mic session: send to STT now ────
+                    if (isConn && isStreaming) {
+                      _audioPipeline.finalizeNow();
+                      await _audioPipeline.stopRingMicFromPhone();
+                      return;
+                    }
+                    // ── Phone-mic fallback (ring not connected) ──────────────
                     if (_audioPipeline.isPhoneMicListening || isStreaming) {
                       _audioPipeline.triggerManualSpeechEnd();
-                      if (isConn) RingReplySender.instance.sendCommand('stop_record');
                     } else {
                       setState(() => _latestTranscript = 'Listening...');
                       _audioPipeline.triggerManualSpeechStart();
-                      if (isConn) RingReplySender.instance.sendCommand('start_listen');
                     }
                   },
                 ),
@@ -1219,11 +1290,16 @@ class _RingCompanionScreenState extends State<RingCompanionScreen>
 
   // ── Gesture guide ─────────────────────────────────────────────────────────
   Widget _buildGestureGuide() {
+    // Matches the firmware button map (XIAO ESP32S3, single button D1):
+    //   Home, double tap → start/stop ring mic (voice → phone)
+    //   Home, hold  >2s  → push-to-talk alternative (hold & speak, release = send)
+    //   Home, single tap → next screen
+    //   2.5s silence     → auto-stops the mic and sends what you said
     final gestures = [
-      ('Single Tap', 'Toggle status / stop AI', Icons.touch_app),
-      ('Double Tap', 'Start/stop mic → AI', Icons.multitrack_audio),
-      ('Triple Tap', 'Capture ring camera', Icons.camera),
-      ('Hold 3s', 'Deep sleep (press to wake)', Icons.power_settings_new),
+      ('Double Tap', 'Start/stop ring mic → AI', Icons.multitrack_audio),
+      ('Hold 2s', 'Push-to-talk (release = send)', Icons.mic),
+      ('Single Tap', 'Next screen', Icons.touch_app),
+      ('Silence 2.5s', 'Auto-sends what you said', Icons.send_to_mobile),
     ];
     return _card_(
       padding: const EdgeInsets.all(20),

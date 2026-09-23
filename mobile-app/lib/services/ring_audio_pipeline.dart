@@ -1,19 +1,48 @@
 // ring_audio_pipeline.dart
 //
-// RING TO PHONE VOICE TRANSFER  (rebuilt from scratch)
+// ═══════════════════════════════════════════════════════════════════════════
+// RING → PHONE VOICE TRANSFER  (rebuilt FROM SCRATCH)
+// ═══════════════════════════════════════════════════════════════════════════
 //
-// DESIGN (simple and reliable):
-//   1. Ring firmware captures mic audio, sends raw PCM chunks over BLE
-//      (CHAR_MIC_AUDIO / 0x6e400002)
-//   2. BLE EventChannel delivers 'audio' events to Dart
-//   3. We accumulate all chunks in a BytesBuilder
-//   4. After 1.5s of silence (no new chunks), we wrap the PCM in a WAV
-//      header and POST it to Deepgram REST - transcript arrives in ~300ms
-//   5. Transcript is displayed on the phone screen (liveTranscript stream)
-//      and forwarded to GLM AI - reply sent back to ring OLED
+// The entire old voice-transfer stack (native Kotlin SpeechRecognizer pipe,
+// "not installed" recognizer errors, double EventChannel subscriptions,
+// silent dead-ends) was removed. This file is the ONE and ONLY place where
+// ring mic audio becomes text on the phone.
 //
-// ONLY the voice-transfer part has been rebuilt.
-// Everything else (BLE connection, tools, chat UI) is unchanged.
+// THE WHOLE FLOW (nothing else is involved):
+//
+//   1. Ring firmware streams raw 16 kHz mono 16-bit PCM over BLE
+//      (CHAR_MIC_AUDIO 0x6e400002):
+//          [0xFF]  start marker  (button hold or phone "Start Listen")
+//          [PCM…]  240-byte chunks, ~133 per second, while speaking
+//          [0xFE]  stop marker   (button release)
+//      Markers are OPTIONAL — without them the first chunk auto-starts and
+//      the silence timer ends the utterance.
+//
+//   2. This pipeline accumulates every PCM chunk in a BytesBuilder.
+//      The UI gets live proof of reception via the `diagnostics` stream
+//      ("2.4s of ring audio received…") so you can always SEE the audio
+//      arriving.
+//
+//   3. End of speech = 0xFE marker, or 1.8 s of silence, or 30 s max.
+//
+//   4. PCM is wrapped in a 44-byte WAV header and POSTed to Deepgram REST.
+//      Two API keys + two models are tried in order, so one bad/expired
+//      key cannot kill the feature.
+//
+//   5. The transcript is shown on the phone IMMEDIATELY (liveTranscript),
+//      then forwarded to the existing agentic brain
+//      (AgentRouterService → ToolExecutorService / GLM chat) exactly like
+//      before, and the reply goes back to the ring OLED.
+//
+//   • No Android SpeechRecognizer anywhere → no "service not installed"
+//     errors, works on every device.
+//   • Every failure shows a SPECIFIC reason on screen — nothing ever
+//     freezes on "Listening…" again.
+//
+// Everything else (BLE connect, camera, caption, TTS reply, phone mic) is
+// untouched and reused.
+// ═══════════════════════════════════════════════════════════════════════════
 
 import 'dart:async';
 import 'dart:convert';
@@ -27,11 +56,12 @@ import 'agent_router_service.dart';
 import 'model_service.dart';
 import 'phone_mic_stt_service.dart';
 import 'ring_ble_service.dart';
+import 'ring_constants.dart';
 import 'ring_reply_sender.dart';
 import 'search_service.dart';
 import 'tool_executor_service.dart';
 
-// Result / State types
+// ── Result / State types (public API — other screens depend on these) ───────
 
 class RingPipelineResult {
   final String transcript;
@@ -49,12 +79,40 @@ class RingPipelineResult {
 
 enum RingPipelineState { idle, listening, transcribing, thinking, replying }
 
-// Keys
+// ── Voice-transfer tuning ────────────────────────────────────────────────────
 
-const _kDeepgramKey    = 'bf8e5c0fbe1d38a88cda424c00213dc8e0e70fc0';
-const _kFireworksKey   = 'fw_3iUKfhBn2vryacJynHPsUU';
+/// 16 kHz × 2 bytes/sample = 32 000 bytes per second.
+const int _kBytesPerSecond = 32000;
+
+/// Below this much captured audio we treat the "utterance" as noise.
+const int _kMinAudioBytes = 6400; // 0.2 s
+
+/// No audio for this long while listening → end of speech.
+const int _kSilenceMs = 1800;
+
+/// Hard cap for one utterance (a stuck button must not eat RAM).
+const int _kMaxAudioBytes = 960000; // 30 s
+
+/// Marker bytes from the ring firmware.
+const int _kMarkerStart = 0xFF;
+const int _kMarkerStop = 0xFE;
+
+// ── Deepgram STT (cloud — no on-device speech service required) ──────────────
+
+// Two keys are tried in order: if the first is expired/invalid the second is
+// used automatically, so the feature survives a bad key.
+const List<String> _kDeepgramKeys = [
+  'bf8e5c0fbe1d38a88cda424c00213dc8e0e70fc0', // primary (ring pipeline)
+  '36dd865f774bfe84b2044e54f9b7c3f175a10634', // fallback (stt service)
+];
+
+const List<String> _kDeepgramModels = ['nova-3', 'nova-2'];
+
+// ── GLM chat (unchanged — the "AI" half, not the voice-transfer half) ────────
+
+const _kFireworksKey = 'fw_3iUKfhBn2vryacJynHPsUU';
 const _kFireworksModel = 'accounts/fireworks/models/glm-5p3-flash';
-const _kFireworksUrl   = 'https://api.fireworks.ai/inference/v1/chat/completions';
+const _kFireworksUrl = 'https://api.fireworks.ai/inference/v1/chat/completions';
 const _kChatSys =
     'You are Zero, a fast AI voice assistant on a smart ring. '
     'Keep replies under 2 short sentences. Be concise, direct, and helpful.';
@@ -67,38 +125,52 @@ class RingAudioPipeline {
   RingAudioPipeline._();
   static final RingAudioPipeline instance = RingAudioPipeline._();
 
-  // State
+  // ── State ─────────────────────────────────────────────────────────────────
+
   bool _active = false;
   bool get isActive => _active;
 
   RingPipelineState _state = RingPipelineState.idle;
   RingPipelineState get state => _state;
-  bool get isListening  => _state == RingPipelineState.listening;
+  bool get isListening => _state == RingPipelineState.listening;
   bool get isProcessing =>
       _state == RingPipelineState.transcribing ||
-      _state == RingPipelineState.thinking     ||
+      _state == RingPipelineState.thinking ||
       _state == RingPipelineState.replying;
+
+  /// True while ring mic audio is flowing (BLE session active).
+  bool _isStreamingFromRing = false;
   bool get isStreamingFromRing => _isStreamingFromRing || isListening;
 
-  bool _isStreamingFromRing = false;
   bool _processingUtterance = false;
+  bool _phoneInitiatedRingMic = false;
 
-  // PCM accumulator - all BLE audio chunks collected here
+  // ── PCM accumulator (the ring's audio lands here) ─────────────────────────
+
   final _pcmAccumulator = BytesBuilder(copy: false);
   Timer? _silenceTimer;
+  int get receivedBytes => _pcmAccumulator.length;
+  double get receivedSeconds => _pcmAccumulator.length / _kBytesPerSecond;
 
-  // Streams
-  final _resultController         = StreamController<RingPipelineResult>.broadcast();
-  final _energyController         = StreamController<double>.broadcast();
+  // ── Streams (public API) ──────────────────────────────────────────────────
+
+  final _resultController = StreamController<RingPipelineResult>.broadcast();
+  final _energyController = StreamController<double>.broadcast();
   final _liveTranscriptController = StreamController<String>.broadcast();
   final _liveAiResponseController = StreamController<String>.broadcast();
-  final _stateController          = StreamController<RingPipelineState>.broadcast();
+  final _stateController = StreamController<RingPipelineState>.broadcast();
 
-  Stream<RingPipelineResult> get results       => _resultController.stream;
-  Stream<double>             get energyStream   => _energyController.stream;
-  Stream<String>             get liveTranscript => _liveTranscriptController.stream;
-  Stream<String>             get liveAiResponse => _liveAiResponseController.stream;
-  Stream<RingPipelineState>  get stateStream    => _stateController.stream;
+  /// Live human-readable status of the ring→phone voice link, e.g.
+  /// "Ring audio received: 2.4s (77 KB)". The companion screen shows this so
+  /// the user can always SEE that ring audio is arriving.
+  final _diagnosticsController = StreamController<String>.broadcast();
+
+  Stream<RingPipelineResult> get results => _resultController.stream;
+  Stream<double> get energyStream => _energyController.stream;
+  Stream<String> get liveTranscript => _liveTranscriptController.stream;
+  Stream<String> get liveAiResponse => _liveAiResponseController.stream;
+  Stream<RingPipelineState> get stateStream => _stateController.stream;
+  Stream<String> get diagnostics => _diagnosticsController.stream;
 
   StreamSubscription? _bleSubscription;
 
@@ -106,6 +178,12 @@ class RingAudioPipeline {
   bool get isPhoneMicListening => _phoneMicActive;
 
   bool _initialized = false;
+
+  // Throttle for the diagnostics stream (≤ ~10 updates/s).
+  DateTime _lastDiagEmit = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // Remember which Deepgram key worked last (skip dead keys).
+  int _workingKeyIndex = 0;
 
   // Agentic tool executor (ModelService/SearchService are factory singletons)
   final _executor = ToolExecutorService(ModelService(), SearchService());
@@ -118,16 +196,20 @@ class RingAudioPipeline {
     if (_initialized) return;
     _initialized = true;
     start();
-    debugPrint('[RingPipeline] Initialized - ring mic -> Deepgram REST -> phone screen');
+    debugPrint(
+      '[RingVoice] Ready — ring mic → Deepgram REST → text on phone. '
+      'Double-tap the ring to speak (or hold the button 2s).',
+    );
   }
 
   void start() {
     if (_active) return;
     _active = true;
     _pcmAccumulator.clear();
+    // Subscribe to BLE events exactly ONCE.
     _bleSubscription?.cancel();
     _bleSubscription = RingBleService.instance.events.listen(_onBleEvent);
-    debugPrint('[RingPipeline] BLE event listener active');
+    debugPrint('[RingVoice] BLE event listener attached');
   }
 
   void stop() {
@@ -148,10 +230,11 @@ class RingAudioPipeline {
     _liveTranscriptController.close();
     _liveAiResponseController.close();
     _stateController.close();
+    _diagnosticsController.close();
   }
 
   // ---------------------------------------------------------------------------
-  // BLE Event Router
+  // BLE event router — the ONLY entry point for ring voice
   // ---------------------------------------------------------------------------
 
   void _onBleEvent(RingEvent event) {
@@ -171,67 +254,88 @@ class RingAudioPipeline {
   }
 
   void _onRingDisconnected() {
+    if (_isStreamingFromRing) {
+      debugPrint('[RingVoice] Ring disconnected mid-utterance');
+      _liveTranscriptController.add('(Ring disconnected)');
+    }
     _isStreamingFromRing = false;
-    _processingUtterance = false;
+    _phoneInitiatedRingMic = false;
     _silenceTimer?.cancel();
     _silenceTimer = null;
     _pcmAccumulator.clear();
-    _setState(RingPipelineState.idle);
+    if (!_processingUtterance) _setState(RingPipelineState.idle);
   }
 
   // ---------------------------------------------------------------------------
-  // Audio Chunk Handler - VOICE TRANSFER ENTRY POINT
+  // Audio chunk handler — ring mic → accumulator
   // ---------------------------------------------------------------------------
 
   void _handleAudioChunk(Uint8List pcm) {
-    // Control markers from firmware:
-    //   0xFF = mic start (double-click gesture on ring)
-    //   0xFE = mic stop  (single-click gesture on ring)
-    if (pcm.length == 1 && pcm[0] == 0xFF) {
-      if (!_isStreamingFromRing && !_processingUtterance) {
-        _startRingListening();
-      }
-      return;
-    }
-    if (pcm.length == 1 && pcm[0] == 0xFE) {
-      if (_isStreamingFromRing && !_processingUtterance) {
-        debugPrint('[RingPipeline] Stop marker received - finalizing');
-        _finalizeSpeech();
-      }
-      return;
-    }
-
     if (pcm.isEmpty) return;
 
-    // First real audio without start marker -> auto-start
-    if (!_isStreamingFromRing && !_processingUtterance) {
+    // ── Control markers (1 byte) ─────────────────────────────────────────────
+    if (pcm.length == 1) {
+      if (pcm[0] == _kMarkerStart) {
+        _phoneInitiatedRingMic = _phoneInitiatedRingMic || _awaitingRingMic;
+        if (!_isStreamingFromRing && !_processingUtterance) {
+          _startRingListening();
+        }
+        return;
+      }
+      if (pcm[0] == _kMarkerStop) {
+        if (_isStreamingFromRing && !_processingUtterance) {
+          debugPrint('[RingVoice] Stop marker (0xFE) — sending to STT now');
+          _finalizeSpeech();
+        }
+        return;
+      }
+      // Any other 1-byte packet: ignore.
+      return;
+    }
+
+    // ── Real PCM chunk ───────────────────────────────────────────────────────
+    if (_processingUtterance) return; // busy with previous utterance
+
+    // First real audio (e.g. firmware without start marker) → auto-start.
+    if (!_isStreamingFromRing) {
       _startRingListening();
+    }
+
+    // Hard cap so a stuck button can't grow forever.
+    if (_pcmAccumulator.length + pcm.length > _kMaxAudioBytes) {
+      debugPrint('[RingVoice] Max utterance length reached — finalizing');
+      _finalizeSpeech();
+      return;
     }
 
     _pcmAccumulator.add(pcm);
     _energyController.add(_rmsEnergy(pcm));
     _resetSilenceTimer();
+    _emitDiagnostics();
   }
 
   void _startRingListening() {
     _isStreamingFromRing = true;
+    _awaitingRingMic = false;
     _pcmAccumulator.clear();
     _setState(RingPipelineState.listening);
-    _liveTranscriptController.add('Listening...');
-    debugPrint('[RingPipeline] Ring mic streaming started');
+    _liveTranscriptController.add('Listening…');
+    debugPrint('[RingVoice] Ring mic session started');
   }
 
   // ---------------------------------------------------------------------------
-  // Silence Detection
+  // Silence detection (safety net — 0xFE marker is the primary end signal)
   // ---------------------------------------------------------------------------
 
   void _resetSilenceTimer() {
     if (_processingUtterance) return;
     _silenceTimer?.cancel();
-    // 1.5 s of silence -> declare end of speech
     _silenceTimer = Timer(
-      const Duration(milliseconds: 1500),
-      _finalizeSpeech,
+      const Duration(milliseconds: _kSilenceMs),
+      () {
+        debugPrint('[RingVoice] ${_kSilenceMs}ms of silence — finalizing');
+        _finalizeSpeech();
+      },
     );
   }
 
@@ -241,102 +345,189 @@ class RingAudioPipeline {
     if (_processingUtterance || !_active) return;
 
     final pcmBytes = _pcmAccumulator.length;
-    // Need at least 200ms of audio (6400 bytes at 16 kHz 16-bit mono)
-    if (pcmBytes < 6400) {
-      debugPrint('[RingPipeline] Too little audio ($pcmBytes bytes) - ignoring');
-      _isStreamingFromRing = false;
+    _isStreamingFromRing = false;
+
+    if (pcmBytes < _kMinAudioBytes) {
+      debugPrint(
+        '[RingVoice] Only ${pcmBytes} bytes captured — too short, ignoring',
+      );
       _pcmAccumulator.clear();
       _setState(RingPipelineState.idle);
+      _liveTranscriptController.add('(No speech detected — try again)');
+      // The ring (older firmware without auto-stop) may still be streaming
+      // silence — ask it to stop so we don't loop forever.
+      _stopRingMicIfPhoneInitiated();
+      if (RingBleService.instance.isConnected) {
+        RingReplySender.instance.sendCommand(kCmdStopRecord);
+      }
       return;
     }
 
-    _isStreamingFromRing = false;
     _processingUtterance = true;
-
     final pcm = Uint8List.fromList(_pcmAccumulator.toBytes());
     _pcmAccumulator.clear();
-    debugPrint('[RingPipeline] Speech end - ${pcm.length} PCM bytes -> Deepgram REST');
+    debugPrint(
+      '[RingVoice] Utterance complete: ${(pcm.length / _kBytesPerSecond).toStringAsFixed(1)}s '
+      '(${pcm.length} PCM bytes) → Deepgram',
+    );
 
     _transcribeAndProcess(pcm);
   }
 
   // ---------------------------------------------------------------------------
-  // Voice Transfer Core: PCM -> Deepgram REST -> Transcript
+  // STT core: PCM → WAV → Deepgram REST → transcript
   // ---------------------------------------------------------------------------
 
   Future<void> _transcribeAndProcess(Uint8List pcm) async {
     _setState(RingPipelineState.transcribing);
-    _liveTranscriptController.add('Transcribing...');
+    _liveTranscriptController.add('Transcribing…');
 
-    String transcript = '';
+    final wav = _buildWav(pcm);
+    debugPrint('[RingVoice] Sending ${wav.length}-byte WAV to Deepgram…');
 
+    var transcript = '';
+    String? lastError;
+
+    // Try keys in order (the known-working key first), then models.
+    final keyOrder = [
+      _workingKeyIndex,
+      for (final i in _kDeepgramKeys.indices)
+        if (i != _workingKeyIndex) i,
+    ];
+
+    var succeeded = false;
+    for (final keyIdx in keyOrder) {
+      for (final model in _kDeepgramModels) {
+        final (text, err) = await _deepgramRest(
+          key: _kDeepgramKeys[keyIdx],
+          model: model,
+          wav: wav,
+        );
+        if (err == null) {
+          transcript = text;
+          _workingKeyIndex = keyIdx;
+          succeeded = true;
+          debugPrint(
+            '[RingVoice] Deepgram OK (key#${keyIdx + 1}, $model): "$transcript"',
+          );
+          break;
+        }
+        lastError = err;
+        debugPrint(
+          '[RingVoice] Deepgram failed (key#${keyIdx + 1}, $model): $err',
+        );
+      }
+      if (succeeded) break;
+    }
+
+    // ── Show the result on the phone — always something concrete ────────────
+    if (transcript.isEmpty) {
+      final msg =
+          lastError != null ? 'STT error: $lastError' : '(No words detected — hold the ring button and speak)';
+      debugPrint('[RingVoice] No transcript — $msg');
+      _liveTranscriptController.add(msg);
+      _liveAiResponseController.add('I could not hear you. Try again.');
+      _processingUtterance = false;
+      _setState(RingPipelineState.idle);
+      _stopRingMicIfPhoneInitiated();
+      return;
+    }
+
+    // THE TRANSCRIPT — this is what appears on the phone screen.
+    _liveTranscriptController.add(transcript);
+
+    await _processUtteranceWithTranscript(transcript);
+  }
+
+  Future<(String, String?)> _deepgramRest({
+    required String key,
+    required String model,
+    required Uint8List wav,
+  }) async {
     try {
-      // Wrap raw PCM in a 44-byte WAV header
-      final wav = _buildWav(pcm);
-      debugPrint('[RingPipeline] Sending ${wav.length} bytes WAV to Deepgram REST...');
-
-      final response = await http.post(
-        Uri.parse(
-          'https://api.deepgram.com/v1/listen'
-          '?model=nova-3'
-          '&smart_format=true'
-          '&language=en-US',
-        ),
-        headers: {
-          'Authorization': 'Token $_kDeepgramKey',
-          'Content-Type': 'audio/wav',
-        },
-        body: wav,
-      ).timeout(const Duration(seconds: 15));
+      final response = await http
+          .post(
+            Uri.parse(
+              'https://api.deepgram.com/v1/listen'
+              '?model=${model}'
+              '&smart_format=true'
+              '&language=en-US',
+            ),
+            headers: {
+              'Authorization': 'Token $key',
+              'Content-Type': 'audio/wav',
+            },
+            body: wav,
+          )
+          .timeout(const Duration(seconds: 20));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final raw = data['results']?['channels']?[0]
             ?['alternatives']?[0]?['transcript'] as String?;
-        transcript = raw?.trim() ?? '';
-        debugPrint('[RingPipeline] Deepgram transcript: "$transcript"');
-      } else {
-        debugPrint(
-          '[RingPipeline] Deepgram HTTP ${response.statusCode}: '
-          '${response.body.substring(0, response.body.length.clamp(0, 200))}',
-        );
+        return (raw?.trim() ?? '', null);
       }
+
+      final body = response.body.length > 200
+          ? response.body.substring(0, 200)
+          : response.body;
+      return ('', 'HTTP ${response.statusCode} ($body)');
     } catch (e) {
-      debugPrint('[RingPipeline] Deepgram REST error: $e');
+      return ('', '$e');
     }
-
-    // Show on phone - even if empty, so UI updates
-    if (transcript.isEmpty) {
-      _liveTranscriptController.add('(Could not recognise - please try again)');
-      _processingUtterance = false;
-      _setState(RingPipelineState.idle);
-      return;
-    }
-
-    // Show transcript on phone - THIS IS WHAT THE USER SEES
-    _liveTranscriptController.add(transcript);
-
-    // Continue to AI response
-    await _processUtteranceWithTranscript(transcript);
   }
 
   // ---------------------------------------------------------------------------
-  // AI Processing — AgentRouter → ToolExecutor (agentic) OR GLM chat
+  // Phone-initiated ring mic (the companion-screen "Start Listen" button)
+  // ---------------------------------------------------------------------------
+
+  bool _awaitingRingMic = false;
+
+  /// Ask the RING to start streaming its mic (phone-initiated session).
+  /// Falls back to nothing if the ring is not connected.
+  Future<bool> startRingMicFromPhone() async {
+    if (!RingBleService.instance.isConnected) return false;
+    _awaitingRingMic = true;
+    _liveTranscriptController.add('Starting ring mic…');
+    await RingReplySender.instance.sendCommand('start_listen');
+    debugPrint('[RingVoice] start_listen sent to ring');
+    return true;
+  }
+
+  /// Ask the ring to stop streaming its mic.
+  Future<void> stopRingMicFromPhone() async {
+    if (!RingBleService.instance.isConnected) return;
+    await RingReplySender.instance.sendCommand(kCmdStopRecord);
+  }
+
+  void _stopRingMicIfPhoneInitiated() {
+    if (_phoneInitiatedRingMic && RingBleService.instance.isConnected) {
+      _phoneInitiatedRingMic = false;
+      // Let the ring know the session is over (its OLED returns to home).
+      RingReplySender.instance.sendCommand(kCmdStopRecord);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // AI processing — AgentRouter → ToolExecutor (agentic) OR GLM chat
+  // (UNCHANGED from before — this is the "AI" half, not voice transfer)
   // ---------------------------------------------------------------------------
 
   Future<void> _processUtteranceWithTranscript(String transcript) async {
     _setState(RingPipelineState.thinking);
     // Keep user's spoken words in liveTranscript — post status to liveAiResponse
-    _liveAiResponseController.add('Searching AI...');
+    _liveAiResponseController.add('Searching AI…');
 
     String chatReply = '';
     AgentRoute route = const AgentRoute(toolName: 'none', isNone: true);
 
     try {
       // ── Step 1: Route via AgentRouterService (fast local + Fireworks GLM) ──
-      debugPrint('[RingPipeline] Routing: "$transcript"');
+      debugPrint('[RingVoice] Routing: "$transcript"');
       route = await AgentRouterService.instance.route(transcript);
-      debugPrint('[RingPipeline] Route: ${route.toolName} | args: ${route.arguments}');
+      debugPrint(
+        '[RingVoice] Route: ${route.toolName} | args: ${route.arguments}',
+      );
 
       if (route.isNone) {
         // ── Conversational reply ─────────────────────────────────────────────
@@ -349,13 +540,12 @@ class RingAudioPipeline {
         if (chatReply.trim().isEmpty) {
           chatReply = 'How can I help you?';
         }
-        debugPrint('[RingPipeline] Chat reply: "$chatReply"');
+        debugPrint('[RingVoice] Chat reply: "$chatReply"');
         _liveAiResponseController.add(chatReply);
-
       } else {
         // ── Execute agentic tool via ToolExecutorService ─────────────────────
-        _liveAiResponseController.add('Doing: ${route.toolName}...');
-        debugPrint('[RingPipeline] Executing tool: ${route.toolName}');
+        _liveAiResponseController.add('Doing: ${route.toolName}…');
+        debugPrint('[RingVoice] Executing tool: ${route.toolName}');
 
         final sb = StringBuffer();
         await for (final chunk in _executor.execute(
@@ -367,7 +557,7 @@ class RingAudioPipeline {
         }
         chatReply = sb.toString().trim();
         if (chatReply.isEmpty) chatReply = 'Done!';
-        debugPrint('[RingPipeline] Tool result: "$chatReply"');
+        debugPrint('[RingVoice] Tool result: "$chatReply"');
         _liveAiResponseController.add(chatReply);
       }
 
@@ -379,14 +569,14 @@ class RingAudioPipeline {
       );
       _resultController.add(result);
       await _sendReplyToRing(result);
-
     } catch (e, st) {
-      debugPrint('[RingPipeline] Fatal error: $e\n$st');
+      debugPrint('[RingVoice] Fatal error: $e\n$st');
       chatReply = 'Sorry, something went wrong.';
       _liveAiResponseController.add(chatReply);
     } finally {
       _processingUtterance = false;
       _setState(RingPipelineState.idle);
+      _stopRingMicIfPhoneInitiated();
     }
   }
 
@@ -395,31 +585,31 @@ class RingAudioPipeline {
   // ---------------------------------------------------------------------------
 
   static Uint8List _buildWav(Uint8List pcm, {
-    int sampleRate    = 16000,
-    int channels      = 1,
+    int sampleRate = 16000,
+    int channels = 1,
     int bitsPerSample = 16,
   }) {
-    final dataSize   = pcm.length;
-    final byteRate   = sampleRate * channels * (bitsPerSample ~/ 8);
+    final dataSize = pcm.length;
+    final byteRate = sampleRate * channels * (bitsPerSample ~/ 8);
     final blockAlign = channels * (bitsPerSample ~/ 8);
-    final hdr        = ByteData(44);
+    final hdr = ByteData(44);
 
-    hdr.setUint32(0,  0x52494646, Endian.big);
-    hdr.setUint32(4,  36 + dataSize, Endian.little);
-    hdr.setUint32(8,  0x57415645, Endian.big);
-    hdr.setUint32(12, 0x666d7420, Endian.big);
-    hdr.setUint32(16, 16,          Endian.little);
-    hdr.setUint16(20, 1,           Endian.little);
-    hdr.setUint16(22, channels,    Endian.little);
-    hdr.setUint32(24, sampleRate,  Endian.little);
-    hdr.setUint32(28, byteRate,    Endian.little);
-    hdr.setUint16(32, blockAlign,  Endian.little);
+    hdr.setUint32(0, 0x52494646, Endian.big); // "RIFF"
+    hdr.setUint32(4, 36 + dataSize, Endian.little);
+    hdr.setUint32(8, 0x57415645, Endian.big); // "WAVE"
+    hdr.setUint32(12, 0x666d7420, Endian.big); // "fmt "
+    hdr.setUint32(16, 16, Endian.little);
+    hdr.setUint16(20, 1, Endian.little); // PCM
+    hdr.setUint16(22, channels, Endian.little);
+    hdr.setUint32(24, sampleRate, Endian.little);
+    hdr.setUint32(28, byteRate, Endian.little);
+    hdr.setUint16(32, blockAlign, Endian.little);
     hdr.setUint16(34, bitsPerSample, Endian.little);
-    hdr.setUint32(36, 0x64617461, Endian.big);
-    hdr.setUint32(40, dataSize,    Endian.little);
+    hdr.setUint32(36, 0x64617461, Endian.big); // "data"
+    hdr.setUint32(40, dataSize, Endian.little);
 
     final out = Uint8List(44 + dataSize);
-    out.setRange(0,  44,            hdr.buffer.asUint8List());
+    out.setRange(0, 44, hdr.buffer.asUint8List());
     out.setRange(44, 44 + dataSize, pcm);
     return out;
   }
@@ -436,35 +626,49 @@ class RingAudioPipeline {
     return (math.sqrt(sum / samples) / 4000.0).clamp(0.0, 1.0);
   }
 
+  /// Emit "Ring audio received: X.Xs (N KB)" — throttled to ~10/s.
+  void _emitDiagnostics() {
+    final now = DateTime.now();
+    if (now.difference(_lastDiagEmit).inMilliseconds < 100) return;
+    _lastDiagEmit = now;
+    final bytes = _pcmAccumulator.length;
+    final seconds = (bytes / _kBytesPerSecond).toStringAsFixed(1);
+    final kb = (bytes / 1024).toStringAsFixed(0);
+    _diagnosticsController.add('Ring audio received: ${seconds}s ($kb KB)');
+  }
+
   Future<String> _fireworksChat(String query) async {
     try {
       final body = jsonEncode({
-        'model':       _kFireworksModel,
-        'max_tokens':  800,
-        'top_k':       40,
+        'model': _kFireworksModel,
+        'max_tokens': 800,
+        'top_k': 40,
         'temperature': 0.5,
         'messages': [
           {'role': 'system', 'content': _kChatSys},
-          {'role': 'user',   'content': query},
+          {'role': 'user', 'content': query},
         ],
       });
-      final resp = await http.post(
-        Uri.parse(_kFireworksUrl),
-        headers: {
-          'Accept':        'application/json',
-          'Content-Type':  'application/json',
-          'Authorization': 'Bearer $_kFireworksKey',
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 10));
+      final resp = await http
+          .post(
+            Uri.parse(_kFireworksUrl),
+            headers: {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $_kFireworksKey',
+            },
+            body: body,
+          )
+          .timeout(const Duration(seconds: 10));
 
       if (resp.statusCode == 200) {
         final decoded = jsonDecode(resp.body) as Map<String, dynamic>;
         return (decoded['choices']?[0]?['message']?['content'] as String?)
-                ?.trim() ?? '';
+                ?.trim() ??
+            '';
       }
     } catch (e) {
-      debugPrint('[RingPipeline] GLM error: $e');
+      debugPrint('[RingVoice] GLM error: $e');
     }
     return '';
   }
@@ -475,7 +679,7 @@ class RingAudioPipeline {
     try {
       await RingReplySender.instance.sendTextAsAudio(caption);
     } catch (e) {
-      debugPrint('[RingPipeline] TTS error: $e');
+      debugPrint('[RingVoice] TTS error: $e');
     }
   }
 
@@ -485,22 +689,30 @@ class RingAudioPipeline {
   }
 
   // ---------------------------------------------------------------------------
-  // Manual triggers (UI buttons - phone mic)
+  // Manual triggers (UI buttons)
   // ---------------------------------------------------------------------------
+
+  /// Finalize whatever ring audio is buffered right now (Stop & Send button).
+  void finalizeNow() {
+    if (_isStreamingFromRing && !_processingUtterance) {
+      debugPrint('[RingVoice] Manual finalize requested');
+      _finalizeSpeech();
+    }
+  }
 
   Future<void> triggerManualSpeechStart() async {
     if (_phoneMicActive) return;
     _phoneMicActive = true;
     _setState(RingPipelineState.listening);
-    _liveTranscriptController.add('Listening via phone mic...');
-    debugPrint('[RingPipeline] Phone mic listening started');
+    _liveTranscriptController.add('Listening via phone mic…');
+    debugPrint('[RingVoice] Phone mic listening started');
 
     await PhoneMicSTT.instance.startListening(
       listenFor: const Duration(seconds: 12),
       pauseFor: const Duration(seconds: 2),
       onResult: (transcript) async {
         _phoneMicActive = false;
-        debugPrint('[RingPipeline] Phone mic transcript: "$transcript"');
+        debugPrint('[RingVoice] Phone mic transcript: "$transcript"');
         if (transcript.trim().isNotEmpty) {
           _liveTranscriptController.add(transcript);
           _processingUtterance = true;

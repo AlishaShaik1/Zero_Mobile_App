@@ -881,6 +881,17 @@ void onDoubleTap() {
       break;
   }
 
+  // Home screen: double tap TOGGLES the ring mic (start → stream to phone,
+  // stop → send what was captured). The 2s hold (push-to-talk) still works
+  // as an alternative. All other screens: double tap = sleep.
+  if (currentScreen == SCR_HOME && powerState == PWR_AWAKE) {
+    if (audioStreaming) {
+      stopAudioStreamHold();
+    } else {
+      startAudioStreamHold();
+    }
+    return;
+  }
   // Default: double tap = sleep
   enterAsleep();
 }
@@ -1362,7 +1373,7 @@ void updateMascotAnimation() {
   lastDraw = millis();
 
   if (audioStreaming) {
-    drawGenericScreen("Listening...", "release to send");
+    drawGenericScreen("Listening...", "2x: stop & send");
     return;
   }
   if (powerOffConfirmActive) {
@@ -1443,6 +1454,9 @@ class CommandCallback : public NimBLECharacteristicCallbacks {
     else if (cmd == "record_video") startVideoRecording();
     else if (cmd == "record_audio") startAudioRecording();
     else if (cmd == "take_note") saveVoiceNote();
+    // ── Ring → phone voice transfer (phone-initiated mic session) ──────────
+    else if (cmd == "start_listen") startAudioStreamHold();
+    else if (cmd == "stop_record") stopAudioStreamHold();
   }
 };
 
@@ -1486,9 +1500,20 @@ void setupBLE() {
 // ============================================================================
 // SECTION 10b — PUSH-TO-TALK AUDIO STREAMING (open-ended hold)
 // ============================================================================
+// ── Silence auto-stop (ring → phone voice transfer) ─────────────────────────
+// If streaming is latched (button held, or the phone started it via the
+// "start_listen" BLE command) but no speech is heard for this long, the ring
+// stops the session and sends the 0xFE stop marker so the phone finalizes
+// the utterance. Prevents a session from running (and the OLED from showing
+// "Listening…") forever.
+static unsigned long lastLoudMs = 0;
+#define SILENCE_AUTO_STOP_MS   2500
+#define SILENCE_RMS_THRESHOLD  300   // mean abs amplitude on 16-bit PDM audio
+
 void startAudioStreamHold() {
   audioStreaming = true;
   currentExpr = EXPR_LISTENING;
+  lastLoudMs = millis();
   if (chrAudioUp) {
     uint8_t startMarker = 0xFF;
     chrAudioUp->setValue(&startMarker, 1);
@@ -1513,6 +1538,21 @@ void streamAudioChunk() {
   size_t bytesRead = 0;
   i2s_read(I2S_PORT_MIC, chunk, sizeof(chunk), &bytesRead, portMAX_DELAY);
   if (chrAudioUp && bytesRead > 0) {
+    // Cheap loudness check (mean abs amplitude) for the auto-stop above.
+    unsigned long sum = 0;
+    size_t n = bytesRead / 2;
+    for (size_t i = 0; i < n; i++) {
+      int16_t s = chunk[i];
+      sum += (s < 0) ? (unsigned long)(-s) : (unsigned long)s;
+    }
+    unsigned long meanAmp = (n > 0) ? (sum / n) : 0;
+    if (meanAmp >= SILENCE_RMS_THRESHOLD) {
+      lastLoudMs = millis();
+    } else if ((millis() - lastLoudMs) > SILENCE_AUTO_STOP_MS) {
+      // 2.5s of silence → close the session, phone gets the 0xFE marker.
+      stopAudioStreamHold();
+      return;
+    }
     chrAudioUp->setValue((uint8_t*)chunk, bytesRead);
     chrAudioUp->notify();
   }

@@ -71,8 +71,9 @@ class RingBleHandler(private val context: Context) {
     lateinit var backgroundProcessor: BackgroundRingProcessor
     fun isBackgroundProcessorInitialized() = ::backgroundProcessor.isInitialized
 
-    // Direct reference to native STT handler for 0ms audio routing
-    var ringStt: RingSttHandler? = null
+    // Diagnostics: counts ring mic chunks since the last start marker so the
+    // ring→phone voice link is verifiable in logcat (tag "RingBle").
+    private var audioChunkCounter = 0
 
     // Auto-reconnect supervisor loop
     private var reconnectRunnable: Runnable? = null
@@ -523,22 +524,37 @@ class RingBleHandler(private val context: Context) {
     private fun routeNotification(uuid: UUID, bytes: ByteArray) {
         when (uuid) {
             CHAR_MIC_AUDIO -> {
-                // Direct native routing to RingSttHandler (0ms latency, no Dart serialization)
-                val stt = ringStt
-                if (stt != null) {
-                    if (bytes.size == 1 && bytes[0] == 0xFF.toByte()) {
-                        stt.startStt()
-                    } else if (bytes.size == 1 && bytes[0] == 0xFE.toByte()) {
-                        stt.stopStt()
-                    } else if (bytes.isNotEmpty()) {
-                        stt.pushChunk(bytes)
+                // ── Ring → phone voice transfer ─────────────────────────────
+                // Native SpeechRecognizer routing was REMOVED (it required an
+                // on-device speech service that many phones report as "not
+                // installed"). The audio now goes straight to:
+                //   1. BackgroundRingProcessor  (when app is backgrounded)
+                //   2. Dart RingAudioPipeline   (when app is foreground)
+                // which transcribes via cloud STT. No device service needed.
+
+                // Diagnostics: verify the audio link is actually flowing.
+                val b0 = bytes.first()
+                if (bytes.size == 1 && (b0 == 0xFF.toByte() || b0 == 0xFE.toByte())) {
+                    audioChunkCounter = 0
+                    android.util.Log.i(
+                        "RingBle",
+                        "Ring mic marker: " +
+                            (if (b0 == 0xFF.toByte()) "START (0xFF)" else "STOP (0xFE)")
+                    )
+                } else if (bytes.isNotEmpty()) {
+                    audioChunkCounter++
+                    if (audioChunkCounter == 1 || audioChunkCounter % 200 == 0) {
+                        android.util.Log.i(
+                            "RingBle",
+                            "Ring mic audio flowing: $audioChunkCounter chunks so far (last ${bytes.size} bytes)"
+                        )
                     }
                 }
-                // Always route audio to background processor (no-op if app is foreground)
+
                 if (::backgroundProcessor.isInitialized) {
                     backgroundProcessor.onAudioChunk(bytes)
                 }
-                // Also send to Dart EventChannel (for foreground Dart pipeline)
+                // Send to Dart EventChannel (foreground Dart pipeline does the STT)
                 sendEvent(mapOf("type" to "audio", "data" to bytes))
             }
             CHAR_MEDIA -> {

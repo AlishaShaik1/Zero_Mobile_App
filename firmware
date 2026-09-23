@@ -881,6 +881,16 @@ void onDoubleTap() {
       break;
   }
 
+  // Home screen: double tap TOGGLES the ring mic (start/stop voice → phone).
+  // The 2s hold (push-to-talk) still works as an alternative.
+  if (currentScreen == SCR_HOME && powerState == PWR_AWAKE) {
+    if (audioStreaming) {
+      stopAudioStreamHold();
+    } else {
+      startAudioStreamHold();
+    }
+    return;
+  }
   // Default: double tap = sleep
   enterAsleep();
 }
@@ -1362,7 +1372,7 @@ void updateMascotAnimation() {
   lastDraw = millis();
 
   if (audioStreaming) {
-    drawGenericScreen("Listening...", "release to send");
+    drawGenericScreen("Listening...", "2x: stop & send");
     return;
   }
   if (powerOffConfirmActive) {
@@ -1443,6 +1453,9 @@ class CommandCallback : public NimBLECharacteristicCallbacks {
     else if (cmd == "record_video") startVideoRecording();
     else if (cmd == "record_audio") startAudioRecording();
     else if (cmd == "take_note") saveVoiceNote();
+    // ── Ring → phone voice transfer (phone-initiated mic session) ──────────
+    else if (cmd == "start_listen") startAudioStreamHold();
+    else if (cmd == "stop_record") stopAudioStreamHold();
   }
 };
 
@@ -1484,15 +1497,31 @@ void setupBLE() {
 // ============================================================================
 // SECTION 10b — PUSH-TO-TALK AUDIO STREAMING (open-ended hold)
 // ============================================================================
+// ── Silence auto-stop (ring → phone voice transfer) ─────────────────────────
+static unsigned long lastLoudMs = 0;
+#define SILENCE_AUTO_STOP_MS   2500
+#define SILENCE_RMS_THRESHOLD  300
+
 void startAudioStreamHold() {
   audioStreaming = true;
   currentExpr = EXPR_LISTENING;
+  lastLoudMs = millis();
+  if (chrAudioUp) {
+    uint8_t startMarker = 0xFF;
+    chrAudioUp->setValue(&startMarker, 1);
+    chrAudioUp->notify();
+  }
   markActivity();
 }
 
 void stopAudioStreamHold() {
   audioStreaming = false;
   currentExpr = EXPR_THINKING;
+  if (chrAudioUp) {
+    uint8_t stopMarker = 0xFE;
+    chrAudioUp->setValue(&stopMarker, 1);
+    chrAudioUp->notify();
+  }
   markActivity();
 }
 
@@ -1501,6 +1530,19 @@ void streamAudioChunk() {
   size_t bytesRead = 0;
   i2s_read(I2S_PORT_MIC, chunk, sizeof(chunk), &bytesRead, portMAX_DELAY);
   if (chrAudioUp && bytesRead > 0) {
+    unsigned long sum = 0;
+    size_t n = bytesRead / 2;
+    for (size_t i = 0; i < n; i++) {
+      int16_t s = chunk[i];
+      sum += (s < 0) ? (unsigned long)(-s) : (unsigned long)s;
+    }
+    unsigned long meanAmp = (n > 0) ? (sum / n) : 0;
+    if (meanAmp >= SILENCE_RMS_THRESHOLD) {
+      lastLoudMs = millis();
+    } else if ((millis() - lastLoudMs) > SILENCE_AUTO_STOP_MS) {
+      stopAudioStreamHold();
+      return;
+    }
     chrAudioUp->setValue((uint8_t*)chunk, bytesRead);
     chrAudioUp->notify();
   }
